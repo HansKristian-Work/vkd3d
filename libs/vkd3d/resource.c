@@ -1397,12 +1397,12 @@ static bool d3d12_resource_get_mapped_memory_range(struct d3d12_resource *resour
     if (range && range->End <= range->Begin)
         return false;
 
-    if (device->memory_properties.memoryTypes[resource->mem.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    if (device->memory_properties.memoryTypes[resource->mem.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         return false;
 
     vk_mapped_range->sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     vk_mapped_range->pNext = NULL;
-    vk_mapped_range->memory = resource->mem.vk_memory;
+    vk_mapped_range->memory = resource->mem.device_allocation.vk_memory;
 
     if (resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     {
@@ -2104,7 +2104,7 @@ static HRESULT d3d12_resource_bind_sparse_metadata(struct d3d12_resource *resour
     VK_CALL(vkGetImageMemoryRequirements(device->vk_device, resource->res.vk_image, &memory_requirements));
 
     if ((vr = vkd3d_allocate_device_memory(device, metadata_size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            memory_requirements.memoryTypeBits, NULL, &sparse->vk_metadata_memory, NULL)))
+            memory_requirements.memoryTypeBits, NULL, &sparse->vk_metadata_memory)))
     {
         ERR("Failed to allocate device memory for sparse metadata, vr %d.\n", vr);
         hr = hresult_from_vk_result(vr);
@@ -2137,7 +2137,7 @@ static HRESULT d3d12_resource_bind_sparse_metadata(struct d3d12_resource *resour
                 VkSparseMemoryBind *bind = &memory_binds[j++];
                 bind->resourceOffset = req->imageMipTailOffset + req->imageMipTailStride * k;
                 bind->size = req->imageMipTailSize;
-                bind->memory = sparse->vk_metadata_memory;
+                bind->memory = sparse->vk_metadata_memory.vk_memory;
                 bind->memoryOffset = metadata_size;
                 bind->flags = VK_SPARSE_MEMORY_BIND_METADATA_BIT;
 
@@ -2314,8 +2314,7 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
 
     if (resource->flags & VKD3D_RESOURCE_RESERVED)
     {
-        VK_CALL(vkFreeMemory(device->vk_device, resource->sparse.vk_metadata_memory, NULL));
-
+        vkd3d_free_device_memory(device, &resource->sparse.vk_metadata_memory);
         vkd3d_free(resource->sparse.tiles);
         vkd3d_free(resource->sparse.tilings);
 
@@ -2333,7 +2332,7 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     else if (resource->flags & VKD3D_RESOURCE_RESERVED)
         VK_CALL(vkDestroyBuffer(device->vk_device, resource->res.vk_buffer, NULL));
 
-    if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.vk_memory)
+    if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.device_allocation.vk_memory)
         vkd3d_free_memory(device, &device->memory_allocator, &resource->mem);
 
     if (resource->vrs_view)
@@ -2506,7 +2505,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             goto fail;
 
         if ((vr = VK_CALL(vkBindImageMemory(device->vk_device, object->res.vk_image,
-                object->mem.vk_memory, object->mem.offset))))
+                object->mem.device_allocation.vk_memory, object->mem.offset))))
         {
             ERR("Failed to bind image memory, vr %d.\n", vr);
             hr = hresult_from_vk_result(vr);
@@ -2625,7 +2624,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
     if (d3d12_resource_is_texture(object))
     {
         if ((vr = VK_CALL(vkBindImageMemory(device->vk_device, object->res.vk_image,
-                object->mem.vk_memory, object->mem.offset)) < 0))
+                object->mem.device_allocation.vk_memory, object->mem.offset)) < 0))
         {
             ERR("Failed to bind image memory, vr %d.\n", vr);
             hr = hresult_from_vk_result(vr);
@@ -5180,6 +5179,7 @@ static HRESULT d3d12_descriptor_heap_init_data_buffer(struct d3d12_descriptor_he
             device->device_info.properties2.properties.limits.nonCoherentAtomSize);
     VkDeviceSize raw_va_buffer_size = 0, offset_buffer_size = 0;
     VKD3D_UNUSED VkDeviceSize descriptor_heap_info_size = 0;
+    VkMemoryPropertyFlags property_flags;
     VkDeviceSize buffer_size, offset;
     D3D12_HEAP_PROPERTIES heap_info;
     D3D12_RESOURCE_DESC buffer_desc;
@@ -5231,12 +5231,15 @@ static HRESULT d3d12_descriptor_heap_init_data_buffer(struct d3d12_descriptor_he
         if (FAILED(hr = vkd3d_create_buffer(device, &heap_info, heap_flags, &buffer_desc, &descriptor_heap->vk_buffer)))
             return hr;
 
+        property_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_UPLOAD_HVV)
+            property_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
         if (FAILED(hr = vkd3d_allocate_buffer_memory(device, descriptor_heap->vk_buffer,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                &descriptor_heap->vk_memory)))
+                property_flags, &descriptor_heap->device_allocation)))
             return hr;
 
-        if ((vr = VK_CALL(vkMapMemory(device->vk_device, descriptor_heap->vk_memory,
+        if ((vr = VK_CALL(vkMapMemory(device->vk_device, descriptor_heap->device_allocation.vk_memory,
                 0, VK_WHOLE_SIZE, 0, &descriptor_heap->host_memory))))
         {
             ERR("Failed to map buffer, vr %d.\n", vr);
@@ -5245,7 +5248,7 @@ static HRESULT d3d12_descriptor_heap_init_data_buffer(struct d3d12_descriptor_he
     }
     else
     {
-        descriptor_heap->vk_memory = VK_NULL_HANDLE;
+        memset(&descriptor_heap->device_allocation, 0, sizeof(descriptor_heap->device_allocation));
         descriptor_heap->vk_buffer = VK_NULL_HANDLE;
         descriptor_heap->host_memory = vkd3d_calloc(1, buffer_size);
     }
@@ -5517,14 +5520,14 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
     const struct vkd3d_vk_device_procs *vk_procs = &descriptor_heap->device->vk_procs;
     struct d3d12_device *device = descriptor_heap->device;
 
-    if (!descriptor_heap->vk_memory)
+    if (!descriptor_heap->device_allocation.vk_memory)
         vkd3d_free(descriptor_heap->host_memory);
 
     if (descriptor_heap->gpu_va != 0)
         d3d12_device_return_descriptor_heap_gpu_va(device, descriptor_heap->gpu_va);
 
     VK_CALL(vkDestroyBuffer(device->vk_device, descriptor_heap->vk_buffer, NULL));
-    VK_CALL(vkFreeMemory(device->vk_device, descriptor_heap->vk_memory, NULL));
+    vkd3d_free_device_memory(device, &descriptor_heap->device_allocation);
 
     VK_CALL(vkDestroyDescriptorPool(device->vk_device, descriptor_heap->vk_descriptor_pool, NULL));
 
@@ -5599,7 +5602,7 @@ static ULONG STDMETHODCALLTYPE d3d12_query_heap_Release(ID3D12QueryHeap *iface)
 
         VK_CALL(vkDestroyQueryPool(device->vk_device, heap->vk_query_pool, NULL));
         VK_CALL(vkDestroyBuffer(device->vk_device, heap->vk_buffer, NULL));
-        VK_CALL(vkFreeMemory(device->vk_device, heap->vk_memory, NULL));
+        vkd3d_free_device_memory(device, &heap->device_allocation);
 
         vkd3d_free(heap);
 
@@ -5778,7 +5781,7 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
         }
 
         if (FAILED(hr = vkd3d_allocate_buffer_memory(device, object->vk_buffer,
-                VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, &object->vk_memory)))
+                VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, &object->device_allocation)))
         {
             VK_CALL(vkDestroyBuffer(device->vk_device, object->vk_buffer, NULL));
             vkd3d_free(object);
@@ -5804,77 +5807,92 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
     return S_OK;
 }
 
-static uint32_t vkd3d_memory_info_find_global_mask(struct d3d12_device *device)
+struct vkd3d_memory_topology
 {
-    /* Never allow memory types from any PCI-pinned heap.
-     * If we allow it, it might end up being used as a fallback memory type, which will cause severe instabilities.
-     * These types should only be used in a controlled fashion. */
-    VkDeviceSize largest_device_local_heap_size = 0;
-    VkDeviceSize largest_host_only_heap_size = 0;
-    uint32_t largest_device_local_heap_index = 0;
-    uint32_t largest_host_only_heap_index = 0;
-    uint32_t device_local_heap_count = 0;
-    uint32_t host_only_heap_count = 0;
+    VkDeviceSize largest_device_local_heap_size;
+    VkDeviceSize largest_host_only_heap_size;
+    uint32_t largest_device_local_heap_index;
+    uint32_t largest_host_only_heap_index;
+    uint32_t device_local_heap_count;
+    uint32_t host_only_heap_count;
     bool exists_device_only_type;
-    VkMemoryPropertyFlags flags;
     bool exists_host_only_type;
+};
+
+static void vkd3d_memory_info_get_topology(struct vkd3d_memory_topology *topology,
+        struct d3d12_device *device)
+{
+    VkMemoryPropertyFlags flags;
     VkDeviceSize heap_size;
     uint32_t heap_index;
-    uint32_t i, mask;
+    unsigned int i;
+
+    memset(topology, 0, sizeof(*topology));
 
     for (i = 0; i < device->memory_properties.memoryHeapCount; i++)
     {
         heap_size = device->memory_properties.memoryHeaps[i].size;
         if (device->memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
         {
-            if (heap_size > largest_device_local_heap_size)
+            if (heap_size > topology->largest_device_local_heap_size)
             {
-                largest_device_local_heap_index = i;
-                largest_device_local_heap_size = heap_size;
+                topology->largest_device_local_heap_index = i;
+                topology->largest_device_local_heap_size = heap_size;
             }
-            device_local_heap_count++;
+            topology->device_local_heap_count++;
         }
         else
         {
-            if (heap_size > largest_host_only_heap_size)
+            if (heap_size > topology->largest_host_only_heap_size)
             {
-                largest_host_only_heap_index = i;
-                largest_host_only_heap_size = heap_size;
+                topology->largest_host_only_heap_index = i;
+                topology->largest_host_only_heap_size = heap_size;
             }
-            host_only_heap_count++;
+            topology->host_only_heap_count++;
         }
     }
 
+    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
+    {
+        flags = device->memory_properties.memoryTypes[i].propertyFlags;
+        heap_index = device->memory_properties.memoryTypes[i].heapIndex;
+
+        if (heap_index == topology->largest_device_local_heap_index &&
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
+        {
+            topology->exists_device_only_type = true;
+        }
+        else if (heap_index == topology->largest_host_only_heap_index &&
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0 &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
+        {
+            topology->exists_host_only_type = true;
+        }
+    }
+}
+
+static uint32_t vkd3d_memory_info_find_global_mask(const struct vkd3d_memory_topology *topology, struct d3d12_device *device)
+{
+    /* Never allow memory types from any PCI-pinned heap.
+     * If we allow it, it might end up being used as a fallback memory type, which will cause severe instabilities.
+     * These types should only be used in a controlled fashion. */
+    VkMemoryPropertyFlags flags;
+    uint32_t heap_index;
+    uint32_t i, mask;
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_UPLOAD_HVV)
+        return UINT32_MAX;
+
     /* If we only have one device local heap, or no host-only heaps, there is nothing to do. */
-    if (device_local_heap_count <= 1 || host_only_heap_count == 0)
+    if (topology->device_local_heap_count <= 1 || topology->host_only_heap_count == 0)
         return UINT32_MAX;
 
     /* Verify that there exists a DEVICE_LOCAL type that is not HOST_VISIBLE on this device
      * which maps to the largest device local heap. That way, it is safe to mask out all memory types which are
      * DEVICE_LOCAL | HOST_VISIBLE.
      * Similarly, there must exist a host-only type. */
-    exists_device_only_type = false;
-    exists_host_only_type = false;
-    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
-    {
-        flags = device->memory_properties.memoryTypes[i].propertyFlags;
-        heap_index = device->memory_properties.memoryTypes[i].heapIndex;
-
-        if (heap_index == largest_device_local_heap_index &&
-            (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
-            (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
-        {
-            exists_device_only_type = true;
-        }
-        else if (heap_index == largest_host_only_heap_index &&
-                 (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0 &&
-                 (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
-        {
-            exists_host_only_type = true;
-        }
-    }
-
-    if (!exists_device_only_type || !exists_host_only_type)
+    if (!topology->exists_device_only_type || !topology->exists_host_only_type)
         return UINT32_MAX;
 
     /* Mask out any memory types which are deemed problematic. */
@@ -5883,10 +5901,10 @@ static uint32_t vkd3d_memory_info_find_global_mask(struct d3d12_device *device)
         const VkMemoryPropertyFlags pinned_mask = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         flags = device->memory_properties.memoryTypes[i].propertyFlags;
-        heap_index = device->memory_properties.memoryTypes[i].propertyFlags;
+        heap_index = device->memory_properties.memoryTypes[i].heapIndex;
 
-        if (heap_index != largest_device_local_heap_index &&
-            heap_index != largest_host_only_heap_index &&
+        if (heap_index != topology->largest_device_local_heap_index &&
+            heap_index != topology->largest_host_only_heap_index &&
             (flags & pinned_mask) == pinned_mask)
         {
             mask |= 1u << i;
@@ -5897,18 +5915,67 @@ static uint32_t vkd3d_memory_info_find_global_mask(struct d3d12_device *device)
     return ~mask;
 }
 
+static void vkd3d_memory_info_init_budgets(struct vkd3d_memory_info *info,
+        const struct vkd3d_memory_topology *topology,
+        struct d3d12_device *device)
+{
+    VkMemoryPropertyFlags flags;
+    uint32_t heap_index;
+    uint32_t i;
+
+    info->budget_sensitive_mask = 0;
+
+    /* Nothing to do if we don't have separate heaps. */
+    if (topology->device_local_heap_count == 0 || topology->host_only_heap_count == 0)
+        return;
+    if (!topology->exists_device_only_type || !topology->exists_host_only_type)
+        return;
+
+    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
+    {
+        const VkMemoryPropertyFlags pinned_mask = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        flags = device->memory_properties.memoryTypes[i].propertyFlags;
+        heap_index = device->memory_properties.memoryTypes[i].heapIndex;
+
+        if ((flags & pinned_mask) == pinned_mask && heap_index == topology->largest_device_local_heap_index)
+        {
+            /* Limit this type. This limit is a pure heuristic and we might need further tuning here.
+             * If there's a separate heap type for PCI-e BAR,
+             * don't bother limiting it since the size is already going to be tiny.
+             * The driver will limit us naturally. */
+            info->budget_sensitive_mask |= 1u << i;
+            info->type_budget[i] = device->memory_properties.memoryHeaps[heap_index].size / 16;
+            info->type_current[i] = 0;
+        }
+    }
+}
+
+void vkd3d_memory_info_cleanup(struct vkd3d_memory_info *info,
+        struct d3d12_device *device)
+{
+    pthread_mutex_destroy(&info->budget_lock);
+}
+
 HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkMemoryRequirements memory_requirements;
+    struct vkd3d_memory_topology topology;
     VkBufferCreateInfo buffer_info;
     VkImageCreateInfo image_info;
     VkBuffer buffer;
     VkImage image;
     VkResult vr;
 
-    info->global_mask = vkd3d_memory_info_find_global_mask(device);
+    vkd3d_memory_info_get_topology(&topology, device);
+    info->global_mask = vkd3d_memory_info_find_global_mask(&topology, device);
+    vkd3d_memory_info_init_budgets(info, &topology, device);
+
+    if (pthread_mutex_init(&info->budget_lock, NULL) != 0)
+        return E_OUTOFMEMORY;
 
     memset(&buffer_info, 0, sizeof(buffer_info));
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
